@@ -25,14 +25,17 @@ except ImportError as e:
 # ==================== CONFIGURATION ====================
 
 # Chemin vers l'exécutable Spotify (à adapter selon votre installation)
-SPOTIFY_PATH = r"C:\Users\raphi\AppData\Roaming\Spotify\Spotify.exe"
+SPOTIFY_PATH = r"C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.279.427.0_x64__zpdnekdrzrea0\Spotify.exe"
 
 # Chemin vers le modèle Vosk (sera téléchargé automatiquement si nécessaire)
 VOSK_MODEL_PATH = r"vosk-model-small-fr-0.22"
 
 # Configuration Ollama
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "mistral"
+OLLAMA_MODEL = "mistral"  # Le nom du modèle (peut être mistral, mistral:latest, etc.)
+
+# Variable globale pour stocker le nom exact du modèle trouvé
+OLLAMA_MODEL_ACTUAL = None
 
 # Configuration audio
 SAMPLE_RATE = 16000
@@ -103,8 +106,22 @@ def verifier_ollama() -> bool:
         if response.status_code == 200:
             models = response.json().get('models', [])
             model_names = [model.get('name', '') for model in models]
-            if OLLAMA_MODEL in model_names:
-                print(f"✅ Ollama accessible avec le modèle '{OLLAMA_MODEL}'")
+            
+            # Vérifier si le modèle existe (exact ou avec variante comme mistral:latest)
+            model_found = False
+            matching_model = None
+            
+            for model_name in model_names:
+                # Vérifier correspondance exacte ou si le nom commence par le modèle (ex: mistral:latest)
+                if model_name == OLLAMA_MODEL or model_name.startswith(OLLAMA_MODEL + ':'):
+                    model_found = True
+                    matching_model = model_name
+                    break
+            
+            if model_found:
+                global OLLAMA_MODEL_ACTUAL
+                OLLAMA_MODEL_ACTUAL = matching_model
+                print(f"✅ Ollama accessible avec le modèle '{matching_model}'")
                 return True
             else:
                 print(f"⚠️  Modèle '{OLLAMA_MODEL}' non trouvé. Modèles disponibles : {model_names}")
@@ -129,27 +146,30 @@ def analyser_intention(texte: str) -> Optional[str]:
     if not texte or len(texte.strip()) < MIN_TEXT_LENGTH:
         return None
     
+    # Prompt optimisé pour une réponse rapide et concise
     prompt_system = (
-        "Tu es un assistant vocal. Analyse la demande de l'utilisateur. "
-        "Si l'utilisateur veut lancer Spotify, réponds uniquement 'ACTION_SPOTIFY'. "
-        "Sinon, réponds 'IGNORE'. "
-        "Réponds UNIQUEMENT avec 'ACTION_SPOTIFY' ou 'IGNORE', sans autre texte."
+        "Analyse: l'utilisateur veut-il lancer Spotify? "
+        "Réponds UNIQUEMENT 'ACTION_SPOTIFY' ou 'IGNORE'."
     )
     
-    prompt_complet = f"{prompt_system}\n\nUtilisateur : {texte}\n\nAssistant :"
+    prompt_complet = f"{prompt_system}\n\nTexte: {texte}\n\nRéponse:"
     
     try:
+        # Utiliser le nom exact du modèle trouvé, ou le nom par défaut
+        model_to_use = OLLAMA_MODEL_ACTUAL if OLLAMA_MODEL_ACTUAL else OLLAMA_MODEL
+        
         payload = {
-            "model": OLLAMA_MODEL,
+            "model": model_to_use,
             "prompt": prompt_complet,
             "stream": False,
             "options": {
                 "temperature": 0.1,  # Faible température pour des réponses déterministes
-                "num_predict": 10   # Limite la réponse à quelques tokens
+                "num_predict": 5,    # Limite la réponse à très peu de tokens (ACTION_SPOTIFY ou IGNORE)
+                "num_ctx": 128        # Réduit le contexte pour accélérer
             }
         }
         
-        response = requests.post(OLLAMA_URL, json=payload, timeout=10)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=30)
         response.raise_for_status()
         
         result = response.json()
@@ -164,6 +184,10 @@ def analyser_intention(texte: str) -> Optional[str]:
             # Si la réponse n'est pas claire, on ignore par défaut
             return 'IGNORE'
     
+    except requests.exceptions.Timeout:
+        print(f"⏱️  Timeout lors de la requête à Ollama (le modèle prend trop de temps)")
+        print(f"💡 Essayez de réduire la charge du système ou utilisez un modèle plus léger")
+        return None
     except requests.exceptions.RequestException as e:
         print(f"❌ Erreur lors de la requête à Ollama : {e}")
         return None
@@ -342,7 +366,8 @@ def main_loop() -> None:
     
     # Vérifier Ollama
     if not verifier_ollama():
-        print("\n⚠️  Ollama n'est pas accessible. Le script continuera mais l'analyse d'intention ne fonctionnera pas.")
+        print("\n⚠️  Ollama n'est pas correctement configuré. Le script continuera mais l'analyse d'intention ne fonctionnera pas.")
+        print("   Assurez-vous qu'Ollama est démarré et que le modèle 'mistral' est installé.")
         reponse = input("Voulez-vous continuer quand même ? (o/n) : ")
         if reponse.lower() != 'o':
             sys.exit(1)

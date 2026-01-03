@@ -133,9 +133,39 @@ def verifier_ollama() -> bool:
         return False
 
 
+def analyser_intention_mots_cles(texte: str) -> Optional[str]:
+    """
+    Analyse rapide basée sur des mots-clés (fallback si Ollama est trop lent).
+    
+    Args:
+        texte: Texte transcrit à analyser
+        
+    Returns:
+        str: 'ACTION_SPOTIFY' si détecté, None sinon
+    """
+    if not texte:
+        return None
+    
+    texte_lower = texte.lower()
+    
+    # Mots-clés qui indiquent une intention de lancer Spotify
+    mots_cles_spotify = [
+        'lance spotify', 'ouvre spotify', 'démarre spotify', 'start spotify',
+        'lance spotify', 'ouvrir spotify', 'démarrer spotify',
+        'spotify', 'ouvre spotify', 'lance spotify'
+    ]
+    
+    # Vérifier si le texte contient des mots-clés Spotify
+    for mot_cle in mots_cles_spotify:
+        if mot_cle in texte_lower:
+            return 'ACTION_SPOTIFY'
+    
+    return None
+
+
 def analyser_intention(texte: str) -> Optional[str]:
     """
-    Analyse l'intention de l'utilisateur via Ollama (Mistral).
+    Analyse l'intention de l'utilisateur via Ollama (Mistral) avec fallback sur mots-clés.
     
     Args:
         texte: Texte transcrit à analyser
@@ -146,6 +176,13 @@ def analyser_intention(texte: str) -> Optional[str]:
     if not texte or len(texte.strip()) < MIN_TEXT_LENGTH:
         return None
     
+    # D'abord, essayer la détection rapide par mots-clés
+    intention_mots_cles = analyser_intention_mots_cles(texte)
+    if intention_mots_cles:
+        print("🔍 Intention détectée par mots-clés (rapide)")
+        return intention_mots_cles
+    
+    # Si pas de mots-clés évidents, utiliser Ollama pour une analyse plus fine
     # Prompt optimisé pour une réponse rapide et concise
     prompt_system = (
         "Analyse: l'utilisateur veut-il lancer Spotify? "
@@ -163,13 +200,15 @@ def analyser_intention(texte: str) -> Optional[str]:
             "prompt": prompt_complet,
             "stream": False,
             "options": {
-                "temperature": 0.1,  # Faible température pour des réponses déterministes
-                "num_predict": 5,    # Limite la réponse à très peu de tokens (ACTION_SPOTIFY ou IGNORE)
-                "num_ctx": 128        # Réduit le contexte pour accélérer
+                "temperature": 0.0,   # Température à 0 pour des réponses déterministes
+                "num_predict": 3,     # Limite la réponse à très peu de tokens (ACTION_SPOTIFY ou IGNORE)
+                "num_ctx": 64,        # Réduit le contexte pour accélérer
+                "top_k": 1,           # Réduit les options de génération
+                "top_p": 0.1          # Réduit la diversité
             }
         }
         
-        response = requests.post(OLLAMA_URL, json=payload, timeout=30)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=15)
         response.raise_for_status()
         
         result = response.json()
@@ -185,9 +224,12 @@ def analyser_intention(texte: str) -> Optional[str]:
             return 'IGNORE'
     
     except requests.exceptions.Timeout:
-        print(f"⏱️  Timeout lors de la requête à Ollama (le modèle prend trop de temps)")
-        print(f"💡 Essayez de réduire la charge du système ou utilisez un modèle plus léger")
-        return None
+        print(f"⏱️  Timeout Ollama - Utilisation de la détection par mots-clés")
+        # En cas de timeout, utiliser la détection par mots-clés
+        intention_mots_cles = analyser_intention_mots_cles(texte)
+        if intention_mots_cles:
+            return intention_mots_cles
+        return 'IGNORE'  # Par défaut, ignorer si pas de mots-clés
     except requests.exceptions.RequestException as e:
         print(f"❌ Erreur lors de la requête à Ollama : {e}")
         return None
@@ -218,17 +260,11 @@ def lancer_spotify(engine: pyttsx3.Engine) -> None:
     Args:
         engine: Moteur TTS pour les réponses vocales
     """
-    if not os.path.exists(SPOTIFY_PATH):
-        message = f"Erreur : le chemin vers Spotify est introuvable. Vérifiez le chemin dans le script."
-        print(f"❌ {message}")
-        parler(engine, "Je n'ai pas trouvé Spotify sur votre système. Vérifiez le chemin dans le script.")
-        return
-    
     try:
         # Vérifier si Spotify est déjà en cours d'exécution
         # Sur Windows, on peut vérifier avec tasklist
         result = subprocess.run(
-            ['tasklist', '/FI', f'IMAGENAME eq Spotify.exe'],
+            ['tasklist', '/FI', 'IMAGENAME eq Spotify.exe'],
             capture_output=True,
             text=True,
             timeout=5
@@ -239,10 +275,52 @@ def lancer_spotify(engine: pyttsx3.Engine) -> None:
             parler(engine, "Spotify est déjà lancé")
             return
         
-        # Lancer Spotify
-        subprocess.Popen([SPOTIFY_PATH], shell=False)
-        print("✅ Spotify lancé")
-        parler(engine, "Spotify lancé")
+        # Méthode 1 : Essayer avec le protocole URI spotify: (méthode la plus fiable)
+        try:
+            subprocess.Popen(['start', 'spotify:'], shell=True)
+            print("✅ Spotify lancé via protocole URI")
+            parler(engine, "Spotify lancé")
+            return
+        except:
+            pass
+        
+        # Méthode 2 : Essayer avec le chemin direct si accessible
+        if os.path.exists(SPOTIFY_PATH):
+            try:
+                # Utiliser shell=True pour contourner les restrictions de WindowsApps
+                subprocess.Popen([SPOTIFY_PATH], shell=True)
+                print("✅ Spotify lancé via chemin direct")
+                parler(engine, "Spotify lancé")
+                return
+            except Exception as e:
+                print(f"⚠️  Méthode chemin direct échouée : {e}")
+        
+        # Méthode 3 : Essayer avec PowerShell pour lancer depuis WindowsApps
+        try:
+            ps_command = f'Start-Process "{SPOTIFY_PATH}"'
+            subprocess.run(
+                ['powershell', '-Command', ps_command],
+                timeout=10,
+                capture_output=True
+            )
+            print("✅ Spotify lancé via PowerShell")
+            parler(engine, "Spotify lancé")
+            return
+        except Exception as e:
+            print(f"⚠️  Méthode PowerShell échouée : {e}")
+        
+        # Méthode 4 : Essayer simplement "spotify" comme commande
+        try:
+            subprocess.Popen(['spotify'], shell=True)
+            print("✅ Spotify lancé via commande simple")
+            parler(engine, "Spotify lancé")
+            return
+        except:
+            pass
+        
+        # Si toutes les méthodes échouent
+        print("❌ Impossible de lancer Spotify avec les méthodes disponibles")
+        parler(engine, "Impossible de lancer Spotify. Essayez de l'ouvrir manuellement.")
     
     except subprocess.TimeoutExpired:
         print("⚠️  Timeout lors de la vérification de Spotify")
